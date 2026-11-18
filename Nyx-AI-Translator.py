@@ -22,9 +22,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 APP_NAME = "Nyx-AI-Translator"
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 SUPPORTED_SUBTITLES = {".srt", ".ass", ".ssa", ".vtt", ".webvtt"}
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".webm"}
+BITMAP_SUBTITLE_CODECS = {"hdmv_pgs_subtitle", "pgssub", "dvd_subtitle", "dvdsub", "xsub"}
 LANG_CODE_RE = re.compile(r"^[a-z]{2,3}(?:-[A-Za-z]{2,4})?$")
 ASS_TAG_RE = re.compile(r"\{[^{}]*\}")
 ASS_CONTROL_RE = re.compile(r"\\[Nnh]")
@@ -37,18 +38,32 @@ QUALITY_STOPWORDS = {
 }
 
 LANGUAGE_ALIASES = {
-    "arabic": "ar",
-    "english": "en",
-    "japanese": "ja",
-    "korean": "ko",
-    "french": "fr",
-    "spanish": "es",
-    "german": "de",
-    "italian": "it",
-    "portuguese": "pt",
-    "turkish": "tr",
-    "chinese": "zh",
-    "russian": "ru",
+    # Full names → ISO 639-1
+    "arabic": "ar", "english": "en", "japanese": "ja", "korean": "ko",
+    "french": "fr", "spanish": "es", "german": "de", "italian": "it",
+    "portuguese": "pt", "turkish": "tr", "chinese": "zh", "russian": "ru",
+    "hindi": "hi", "thai": "th", "vietnamese": "vi", "indonesian": "id",
+    "malay": "ms", "persian": "fa", "farsi": "fa", "hebrew": "he",
+    "polish": "pl", "dutch": "nl", "swedish": "sv", "norwegian": "no",
+    "danish": "da", "finnish": "fi", "greek": "el", "czech": "cs",
+    "romanian": "ro", "hungarian": "hu", "ukrainian": "uk", "bengali": "bn",
+    "tamil": "ta", "urdu": "ur", "swahili": "sw", "filipino": "tl",
+    "tagalog": "tl", "catalan": "ca", "croatian": "hr", "serbian": "sr",
+    "slovak": "sk", "slovenian": "sl", "bulgarian": "bg", "latvian": "lv",
+    "lithuanian": "lt", "estonian": "et", "icelandic": "is",
+    # ISO 639-3 (3-letter) → ISO 639-1 (2-letter)
+    "ara": "ar", "eng": "en", "jpn": "ja", "kor": "ko", "fra": "fr",
+    "fre": "fr", "spa": "es", "deu": "de", "ger": "de", "ita": "it",
+    "por": "pt", "tur": "tr", "zho": "zh", "chi": "zh", "rus": "ru",
+    "hin": "hi", "tha": "th", "vie": "vi", "ind": "id", "msa": "ms",
+    "may": "ms", "fas": "fa", "per": "fa", "heb": "he", "pol": "pl",
+    "nld": "nl", "dut": "nl", "swe": "sv", "nor": "no", "dan": "da",
+    "fin": "fi", "ell": "el", "gre": "el", "ces": "cs", "cze": "cs",
+    "ron": "ro", "rum": "ro", "hun": "hu", "ukr": "uk", "ben": "bn",
+    "tam": "ta", "urd": "ur", "swa": "sw", "fil": "tl", "tgl": "tl",
+    "cat": "ca", "hrv": "hr", "srp": "sr", "slk": "sk", "slo": "sk",
+    "slv": "sl", "bul": "bg", "lav": "lv", "lit": "lt", "est": "et",
+    "isl": "is", "ice": "is",
     "auto": "auto",
 }
 
@@ -426,6 +441,44 @@ def make_output_path(source: Path, target_language: str, output_ext: str, overwr
         n += 1
 
 
+def _language_code_variants(code: str) -> set[str]:
+    """Return all known equivalent language codes for a given code.
+
+    For example, 'ar' → {'ar', 'ara'}, 'ja' → {'ja', 'jpn'}, etc.
+    This ensures we detect existing translations regardless of which
+    code variant was used to create them.
+    """
+    code = code.lower()
+    variants = {code}
+    # Collect all aliases that map to the same normalized code
+    normalized = LANGUAGE_ALIASES.get(code, code)
+    variants.add(normalized)
+    for alias, target in LANGUAGE_ALIASES.items():
+        if target == normalized and len(alias) <= 3:  # only short codes, not full names
+            variants.add(alias)
+    return variants
+
+
+def translation_already_exists(video: Path, target_language: str) -> Path | None:
+    """Check if a translated subtitle already exists next to a video file.
+
+    Looks for files like Episode.ar.srt, Episode.ara.ass, and also
+    .failed and numbered variants. Handles mismatched language codes
+    (ar vs ara) by checking all known equivalent codes.
+    Returns the path if found, None otherwise.
+    """
+    code = normalize_language(target_language)
+    stem = strip_known_language_suffix(video.stem)
+    codes = _language_code_variants(code)
+    # Build pattern matching any code variant, with optional .failed or .N suffix
+    code_alt = "|".join(re.escape(c) for c in sorted(codes))
+    pattern = re.compile(re.escape(stem) + r"\.(?:" + code_alt + r")(?:\.failed|\.\d+)?\.\w+$", re.IGNORECASE)
+    for sibling in video.parent.iterdir():
+        if sibling.is_file() and sibling.suffix.lower() in SUPPORTED_SUBTITLES and pattern.match(sibling.name):
+            return sibling
+    return None
+
+
 # --------------------------- providers -------------------------------------
 
 def chunk_units(units: list[TranslationUnit], max_chars: int = 3500) -> list[list[TranslationUnit]]:
@@ -445,6 +498,9 @@ def chunk_units(units: list[TranslationUnit], max_chars: int = 3500) -> list[lis
     return chunks
 
 
+MAX_CHUNK_RETRIES = 3
+
+
 def translate_units(units: list[TranslationUnit], source_language: str, target_language: str, provider: str, cfg: dict[str, Any], retry_smaller: bool = False, progress: Callable[[str], None] | None = None) -> dict[str, str]:
     provider = provider or cfg["general"].get("default_provider", "free")
     translations: dict[str, str] = {}
@@ -453,7 +509,26 @@ def translate_units(units: list[TranslationUnit], source_language: str, target_l
     for idx, chunk in enumerate(chunks, 1):
         if progress and len(chunks) > 1:
             progress(f"Translating chunk {idx}/{len(chunks)} ({len(chunk)} subtitle text units)")
-        translations.update(translate_chunk(chunk, source_language, target_language, provider, cfg, progress=progress))
+        last_err: Exception | None = None
+        for attempt in range(1, MAX_CHUNK_RETRIES + 1):
+            try:
+                translations.update(translate_chunk(chunk, source_language, target_language, provider, cfg, progress=progress))
+                last_err = None
+                break
+            except (json.JSONDecodeError, ValueError, KeyError) as exc:
+                last_err = exc
+                if progress:
+                    progress(f"  ⟳ Chunk {idx} attempt {attempt}/{MAX_CHUNK_RETRIES} failed ({type(exc).__name__}), retrying…")
+        if last_err is not None:
+            # Last resort: split the chunk in half and try each piece
+            if len(chunk) > 1:
+                mid = len(chunk) // 2
+                if progress:
+                    progress(f"  ⟳ Splitting chunk {idx} into two smaller pieces and retrying…")
+                for half in (chunk[:mid], chunk[mid:]):
+                    translations.update(translate_chunk(half, source_language, target_language, provider, cfg, progress=progress))
+            else:
+                raise RuntimeError(f"Chunk {idx} failed after {MAX_CHUNK_RETRIES} retries: {last_err}") from last_err
     return translations
 
 
@@ -537,17 +612,36 @@ def repair_invalid_json_escapes(text: str) -> str:
     return re.sub(r"\\(?![\\\"/bfnrtu])", r"\\\\", text)
 
 
-def parse_json_mapping(text: str) -> dict[str, str]:
+def _strip_json_fences(text: str) -> str:
+    """Remove markdown code fences that LLMs sometimes wrap around JSON."""
     text = text.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        if "Invalid \\escape" not in str(exc):
-            raise
-        data = json.loads(repair_invalid_json_escapes(text))
+    return text
+
+
+def _repair_json(text: str) -> str:
+    """Apply progressively aggressive repairs for common LLM JSON mistakes."""
+    # 1) Fix invalid backslash escapes (ASS markers like \N, \h)
+    text = repair_invalid_json_escapes(text)
+    # 2) Remove trailing commas before ] or }
+    text = re.sub(r",\s*([}\]])", r"\1", text)
+    # 3) Strip control characters that break JSON (except \n \r \t)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+    return text
+
+
+def parse_json_mapping(text: str) -> dict[str, str]:
+    text = _strip_json_fences(text)
+    # Try strict parse first, then repaired parse
+    for attempt, src in enumerate([text, _repair_json(text)]):
+        try:
+            data = json.loads(src)
+            break
+        except json.JSONDecodeError:
+            if attempt == 1:
+                raise
     if isinstance(data, list):
         return {str(item["id"]): str(item["text"]) for item in data}
     if isinstance(data, dict):
@@ -673,7 +767,8 @@ def find_executable(name: str) -> str | None:
         candidates.append(path)
     try:
         shell_cmd = ["where", name] if platform.system().lower() == "windows" else ["which", "-a", name]
-        cp = subprocess.run(shell_cmd, text=True, capture_output=True, timeout=10, check=False)
+        cp = subprocess.run(shell_cmd, capture_output=True, timeout=10, check=False,
+                            text=True, encoding="utf-8", errors="replace")
         if cp.returncode == 0:
             candidates.extend([line.strip() for line in cp.stdout.splitlines() if line.strip()])
     except Exception:
@@ -692,7 +787,8 @@ def find_executable(name: str) -> str | None:
 
 
 def run_command(args: list[str], timeout: int = 120) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, text=True, capture_output=True, timeout=timeout, check=False)
+    return subprocess.run(args, capture_output=True, timeout=timeout, check=False,
+                          text=True, encoding="utf-8", errors="replace")
 
 
 REQUIRED_EMBEDDED_TOOLS = ("ffprobe", "ffmpeg")
@@ -804,10 +900,13 @@ def print_requirement_report() -> None:
     for tool in OPTIONAL_TOOLS:
         path = req["tools"].get(tool)
         print(f"{tool}: {'OK - ' + path if path else 'missing optional'}")
+    pgsrip_path = shutil.which("pgsrip")
+    print(f"pgsrip: {'OK - ' + pgsrip_path if pgsrip_path else 'missing (needed for bitmap/PGS subtitle OCR)'}")
     print("\nModes:")
     print("external subtitle: available")
     embedded_ok = all(req["tools"].get(tool) for tool in REQUIRED_EMBEDDED_TOOLS)
-    print(f"embedded subtitle: {'available' if embedded_ok else 'unavailable (needs ffprobe + ffmpeg)'}")
+    print(f"embedded subtitle (text): {'available' if embedded_ok else 'unavailable (needs ffprobe + ffmpeg)'}")
+    print(f"embedded subtitle (PGS/bitmap OCR): {'available' if pgsrip_path else 'unavailable — install with: pip install \"pgsrip[rapidocr]\"'}")
     if not embedded_ok:
         print("\nInstall embedded-mode dependencies:")
         print(system_dependency_help(include_optional=False))
@@ -866,6 +965,81 @@ def extract_embedded_subtitle(video: Path, track: dict[str, Any], temp_dir: Path
     if cp.returncode != 0 or not out.exists() or out.stat().st_size == 0:
         raise RuntimeError(cp.stderr.strip() or "ffmpeg subtitle extraction failed")
     return out
+
+
+def is_bitmap_subtitle(track: dict[str, Any]) -> bool:
+    """Return True if the track uses a bitmap/image-based subtitle codec (PGS, VobSub, etc.)."""
+    codec = (track.get("codec") or "").lower()
+    return codec in BITMAP_SUBTITLE_CODECS or "pgs" in codec or "dvd_sub" in codec
+
+
+def find_pgsrip() -> str | None:
+    """Return pgsrip executable path, or None if not installed."""
+    return shutil.which("pgsrip")
+
+
+def _find_srt_for_video(directory: Path, stem: str) -> list[Path]:
+    """Find .srt files matching a video stem using plain string matching (not glob).
+
+    Glob breaks on filenames with square brackets, so we iterate the
+    directory and match with str.startswith() instead.
+    """
+    prefix = stem + "."
+    results = []
+    try:
+        for f in directory.iterdir():
+            if f.is_file() and f.suffix.lower() == ".srt" and f.name.startswith(prefix):
+                results.append(f)
+    except OSError:
+        pass
+    return sorted(results, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def ocr_bitmap_subtitle(video: Path, track: dict[str, Any], progress: Callable[[str], None] | None = None) -> Path:
+    """Use pgsrip to OCR a bitmap subtitle track from a video file to SRT.
+
+    pgsrip writes the .srt next to the video file. Returns the path to the generated SRT.
+    """
+    pgsrip = find_pgsrip()
+    if not pgsrip:
+        raise RuntimeError(
+            "pgsrip is required for bitmap (PGS/VobSub) subtitles but was not found.\n"
+            "Install it with:  pip install \"pgsrip[rapidocr]\"\n"
+            "Also install MKVToolNix (mkvmerge). See: https://github.com/ratoaq2/pgsrip"
+        )
+    lang = track.get("language", "und")
+    if progress:
+        progress(f"Bitmap subtitle detected (codec={track.get('codec')}). Running OCR with pgsrip...")
+    # Snapshot existing .srt files before running pgsrip so we can detect new ones
+    parent = video.parent
+    stem = video.stem
+    existing_srts = {f for f in parent.iterdir() if f.is_file() and f.suffix.lower() == ".srt"}
+    # pgsrip writes SRT next to the video, e.g. video.en.srt
+    args = [pgsrip, "-l", lang, str(video)]
+    cp = run_command(args, timeout=600)
+    if cp.returncode != 0:
+        stderr_msg = cp.stderr.strip() if cp.stderr else ""
+        raise RuntimeError(f"pgsrip failed: {stderr_msg or 'unknown error'}")
+    # Find the SRT that pgsrip created — uses plain string matching, not glob,
+    # because filenames with brackets [] break glob patterns
+    candidates = _find_srt_for_video(parent, stem)
+    if not candidates:
+        # Fallback: detect any brand-new .srt files that appeared after pgsrip ran
+        current_srts = {f for f in parent.iterdir() if f.is_file() and f.suffix.lower() == ".srt"}
+        new_srts = sorted((current_srts - existing_srts), key=lambda p: p.stat().st_mtime, reverse=True)
+        if new_srts:
+            candidates = new_srts
+    if not candidates:
+        # Last resort: check current working directory (pgsrip may write there instead)
+        cwd = Path.cwd()
+        if cwd != parent:
+            candidates = _find_srt_for_video(cwd, stem)
+    if not candidates:
+        raise RuntimeError(f"pgsrip ran but no .srt file was found next to {video.name}")
+    srt_path = candidates[0]
+    if progress:
+        progress(f"OCR complete: {srt_path.name}")
+    return srt_path
 
 
 # --------------------------- workflow --------------------------------------
@@ -981,9 +1155,10 @@ def interactive(cfg: dict[str, Any]) -> None:
         print(f"\n{APP_NAME} v{VERSION}\n")
         print("[1] Embedded subtitle inside video")
         print("[2] External subtitle file")
-        print("[3] Settings / Providers")
-        print("[4] Check requirements")
-        print("[5] Exit")
+        print("[3] Batch folder mode")
+        print("[4] Settings / Providers")
+        print("[5] Check requirements")
+        print("[6] Exit")
         choice = prompt("Choice")
         if choice == "1":
             video = Path(prompt("Enter video file path").strip().strip('"').strip("'"))
@@ -1043,10 +1218,40 @@ def interactive(cfg: dict[str, Any]) -> None:
                 continue
             print(f"\nDone:\n{out}")
         elif choice == "3":
-            settings_menu(cfg)
+            folder = Path(prompt("Enter folder path").strip().strip('"').strip("'"))
+            if not folder.is_dir():
+                print("Folder not found.")
+                continue
+            recursive_answer = prompt("Include subfolders? (recursive)", "n").lower()
+            recursive = recursive_answer in {"y", "yes"}
+            print("\nTrack selection when a video has multiple subtitle tracks:")
+            print("  [1] Ask me per video (default)")
+            print("  [2] Always pick the first track")
+            print("  [3] Match by language code (e.g. en, ja)")
+            strategy_choice = prompt("Track strategy", "1")
+            if strategy_choice == "2":
+                track_strategy = "first"
+            elif strategy_choice == "3":
+                lang_code = prompt("Language code to match (e.g. en, ja, es)")
+                track_strategy = f"lang:{lang_code.strip().lower()}"
+            else:
+                track_strategy = "ask"
+            source = prompt("Source language", cfg["general"].get("default_source_language", "auto"))
+            target = prompt("Target language")
+            provider = choose_provider(cfg)
+            try:
+                failed = process_folder(folder, source, target, provider, cfg,
+                                        recursive=recursive, track_strategy=track_strategy)
+                if failed:
+                    print(f"\n{failed} file(s) failed — see output above for details.")
+            except Exception as exc:
+                print(f"Batch folder translation failed: {exc}")
+                continue
         elif choice == "4":
-            print_requirement_report()
+            settings_menu(cfg)
         elif choice == "5":
+            print_requirement_report()
+        elif choice == "6":
             return
 
 
@@ -1064,6 +1269,162 @@ def install_requirements_prompt() -> None:
     print("py -3 Nyx-AI-Translator.py --install-deps --yes" if platform.system().lower() == "windows" else "python Nyx-AI-Translator.py --install-deps --yes")
 
 
+def _format_track_choice(track: dict[str, Any]) -> str:
+    """Format a subtitle track dict as a human-readable label for selection."""
+    parts = [f"#{track['subtitle_index']}"]
+    parts.append(f"lang={track['language']}")
+    if track.get("title"):
+        parts.append(f'"{track["title"]}"')
+    parts.append(f"codec={track['codec']}")
+    flags = []
+    if track.get("default"):
+        flags.append("default")
+    if track.get("forced"):
+        flags.append("forced")
+    if is_bitmap_subtitle(track):
+        flags.append("bitmap/PGS — needs OCR")
+    if flags:
+        parts.append(f"[{', '.join(flags)}]")
+    return " ".join(parts)
+
+
+def _pick_subtitle_track(tracks: list[dict[str, Any]], video_name: str,
+                         strategy: str = "ask") -> dict[str, Any] | None:
+    """Pick a subtitle track based on strategy.
+
+    Strategies:
+      - 'ask'      : auto-pick if one track, prompt if multiple (default)
+      - 'first'    : always pick the first track
+      - 'lang:XX'  : pick the track matching language XX, skip if no match
+    """
+    if not tracks:
+        return None
+    if len(tracks) == 1:
+        return tracks[0]
+
+    # Strategy: first — always pick index 0
+    if strategy == "first":
+        return tracks[0]
+
+    # Strategy: lang:XX — match by language code
+    if strategy.startswith("lang:"):
+        target_lang = strategy.split(":", 1)[1].strip().lower()
+        for t in tracks:
+            if t.get("language", "").lower() == target_lang:
+                return t
+        # No match — skip this video
+        print(f"  ⊘ No track matching language '{target_lang}' — skipping", file=sys.stderr)
+        return None
+
+    # Strategy: ask — prompt the user
+    print(f"\n  Subtitle tracks in {video_name}:", file=sys.stderr)
+    for t in tracks:
+        print(f"    [{t['subtitle_index']}] {_format_track_choice(t)}", file=sys.stderr)
+    while True:
+        try:
+            choice = input(f"  Pick track for {video_name} (0-{len(tracks)-1}, or 's' to skip): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if choice.lower() == "s":
+            return None
+        try:
+            idx = int(choice)
+            if 0 <= idx < len(tracks):
+                return tracks[idx]
+        except ValueError:
+            pass
+        print(f"  Invalid choice. Enter 0-{len(tracks)-1} or 's' to skip.", file=sys.stderr)
+
+
+def process_folder(folder: Path, source_language: str, target_language: str,
+                   provider: str, cfg: dict[str, Any], overwrite: bool = False,
+                   recursive: bool = False, track_strategy: str = "ask") -> int:
+    """Process all video files in a folder, extracting and translating embedded subtitles.
+
+    Returns the number of files that failed (0 = all succeeded).
+    """
+    ensure_embedded_dependencies(offer_install=False)
+
+    # Collect video files
+    if recursive:
+        videos = sorted(f for f in folder.rglob("*") if f.suffix.lower() in VIDEO_EXTENSIONS and f.is_file())
+    else:
+        videos = sorted(f for f in folder.iterdir() if f.suffix.lower() in VIDEO_EXTENSIONS and f.is_file())
+
+    if not videos:
+        print(f"No video files found in {folder}", file=sys.stderr)
+        return 0
+
+    print(f"\nFound {len(videos)} video file(s) in {folder}\n", file=sys.stderr)
+
+    tmp = Path(os.environ.get("TEMP", ".")) / "nyx-ai-translator"
+    succeeded = 0
+    failed = 0
+    skipped = 0
+    progress = lambda msg: print(f"  {msg}", file=sys.stderr, flush=True)
+
+    for i, video in enumerate(videos, 1):
+        header = f"[{i}/{len(videos)}] {video.name}"
+        print(f"{header}", file=sys.stderr)
+        print(f"{'─' * len(header)}", file=sys.stderr)
+
+        if not overwrite:
+            existing = translation_already_exists(video, target_language)
+            if existing:
+                print(f"  ⊘ Already translated → {existing.name} (use --overwrite to redo)", file=sys.stderr)
+                skipped += 1
+                continue
+
+        try:
+            tracks = ffprobe_subtitle_tracks(video)
+        except Exception as exc:
+            print(f"  ✗ Could not read tracks: {exc}", file=sys.stderr)
+            failed += 1
+            continue
+
+        if not tracks:
+            print(f"  ✗ No subtitle tracks found — skipping", file=sys.stderr)
+            skipped += 1
+            continue
+
+        track = _pick_subtitle_track(tracks, video.name, strategy=track_strategy)
+        if track is None:
+            print(f"  ⊘ Skipped", file=sys.stderr)
+            skipped += 1
+            continue
+
+        print(f"  Using track {_format_track_choice(track)}", file=sys.stderr)
+
+        try:
+            if is_bitmap_subtitle(track):
+                # PGS/VobSub — OCR to SRT first, then translate the SRT
+                srt_path = ocr_bitmap_subtitle(video, track, progress=progress)
+                out = translate_subtitle_file(
+                    srt_path, source_language, target_language, provider, cfg,
+                    output_base=video, overwrite=overwrite, progress=progress,
+                )
+            else:
+                # Text subtitle — extract with ffmpeg and translate directly
+                extracted = extract_embedded_subtitle(video, track, tmp)
+                out = translate_subtitle_file(
+                    extracted, source_language, target_language, provider, cfg,
+                    output_base=video, overwrite=overwrite, progress=progress,
+                )
+            print(f"  ✓ {out}", file=sys.stderr)
+            print(out)
+            succeeded += 1
+        except Exception as exc:
+            print(f"  ✗ Failed: {exc}", file=sys.stderr)
+            failed += 1
+
+        print(file=sys.stderr)
+
+    # Summary
+    print(f"\n{'═' * 40}", file=sys.stderr)
+    print(f"Batch complete: {succeeded} translated, {skipped} skipped, {failed} failed out of {len(videos)} video(s)", file=sys.stderr)
+    return failed
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Structure-preserving AI subtitle translator")
     parser.add_argument("setup", nargs="?", help="Use 'setup' to show setup/install help")
@@ -1073,7 +1434,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--yes", action="store_true", help="Do not prompt during dependency install")
     parser.add_argument("--subtitle", help="External subtitle path")
     parser.add_argument("--video", help="Video path for embedded subtitle mode")
+    parser.add_argument("--folder", help="Folder path for batch embedded subtitle translation of all video files")
+    parser.add_argument("--recursive", action="store_true", help="Include subfolders when using --folder")
     parser.add_argument("--track", type=int, help="Embedded subtitle track number from subtitle stream list")
+    parser.add_argument("--track-strategy", default="ask",
+                        help="Track selection for batch mode: 'ask' (prompt per video, default), 'first' (always pick first track), 'lang:XX' (pick track matching language code, e.g. lang:en)")
     parser.add_argument("--from", dest="source_language", default="auto", help="Source language code/name")
     parser.add_argument("--to", dest="target_language", help="Target language code/name")
     parser.add_argument("--provider", default=None, help="Provider: free/openrouter/openai/gemini/deepl/google_cloud/azure/ollama/custom_openai/auto")
@@ -1110,15 +1475,33 @@ def main(argv: list[str] | None = None) -> int:
             tracks = ffprobe_subtitle_tracks(video)
             if args.track < 0 or args.track >= len(tracks):
                 raise ValueError(f"track must be between 0 and {len(tracks) - 1}")
-            tmp = Path(os.environ.get("TEMP", ".")) / "nyx-ai-translator"
-            extracted = extract_embedded_subtitle(video, tracks[args.track], tmp)
-            out = translate_subtitle_file(extracted, args.source_language, args.target_language, provider, cfg, output_base=video, overwrite=args.overwrite, progress=lambda msg: print(msg, file=sys.stderr, flush=True))
+            progress_fn = lambda msg: print(msg, file=sys.stderr, flush=True)
+            selected_track = tracks[args.track]
+            if is_bitmap_subtitle(selected_track):
+                srt_path = ocr_bitmap_subtitle(video, selected_track, progress=progress_fn)
+                out = translate_subtitle_file(srt_path, args.source_language, args.target_language, provider, cfg, output_base=video, overwrite=args.overwrite, progress=progress_fn)
+            else:
+                tmp = Path(os.environ.get("TEMP", ".")) / "nyx-ai-translator"
+                extracted = extract_embedded_subtitle(video, selected_track, tmp)
+                out = translate_subtitle_file(extracted, args.source_language, args.target_language, provider, cfg, output_base=video, overwrite=args.overwrite, progress=progress_fn)
         except Exception as exc:
             print(f"Embedded subtitle translation failed: {exc}", file=sys.stderr)
             print("Tip: run `.\\run-windows.bat --check` on Windows (or `python Nyx-AI-Translator.py --check`) and install missing requirements from README/WINDOWS_QUICK_START.md.", file=sys.stderr)
             return 1
         print(out)
         return 0
+    if args.folder:
+        if not args.target_language:
+            raise SystemExit("--to is required with --folder")
+        folder = Path(args.folder)
+        if not folder.is_dir():
+            raise SystemExit(f"Not a directory: {folder}")
+        failures = process_folder(
+            folder, args.source_language, args.target_language,
+            provider, cfg, overwrite=args.overwrite, recursive=args.recursive,
+            track_strategy=args.track_strategy,
+        )
+        return 1 if failures else 0
     interactive(cfg)
     return 0
 

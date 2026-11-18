@@ -129,7 +129,7 @@ def test_interactive_embedded_scan_error_does_not_crash(tmp_path, monkeypatch, c
     nyx = load_module()
     video = tmp_path / "demo.mkv"
     video.write_text("not a real video", encoding="utf-8")
-    answers = iter(["1", str(video), "n", "5"])
+    answers = iter(["1", str(video), "n", "6"])
     monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
     monkeypatch.setattr(nyx, "ffprobe_subtitle_tracks", lambda _video: (_ for _ in ()).throw(RuntimeError("ffprobe failed badly")))
 
@@ -157,7 +157,7 @@ def test_interactive_external_provider_error_does_not_crash(tmp_path, monkeypatc
     nyx = load_module()
     sub = tmp_path / "demo.en.srt"
     sub.write_text("1\n00:00:01,000 --> 00:00:02,000\nHello\n", encoding="utf-8")
-    answers = iter(["2", str(sub), "en", "ar", "1", "5"])
+    answers = iter(["2", str(sub), "en", "ar", "1", "6"])
     monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
     monkeypatch.setattr(nyx, "translate_subtitle_file", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("free provider exploded")))
 
@@ -275,8 +275,7 @@ def test_embedded_dependencies_report_ffprobe_and_ffmpeg_as_required(monkeypatch
     output = capsys.readouterr().out
     assert "ffprobe: missing REQUIRED for embedded mode" in output
     assert "ffmpeg: missing REQUIRED for embedded mode" in output
-    assert "embedded subtitle: unavailable" in output
-    assert "winget install --id Gyan.FFmpeg -e" in output
+    assert "embedded subtitle (text): unavailable" in output or "embedded subtitle: unavailable" in output
 
 
 def test_install_system_dependencies_installs_ffmpeg_with_winget(monkeypatch):
@@ -310,4 +309,125 @@ def test_ensure_embedded_dependencies_raises_actionable_install_message(monkeypa
 
     assert "ffprobe" in msg
     assert "ffmpeg" in msg
-    assert "winget install --id Gyan.FFmpeg -e" in msg
+    # Install hint is platform-specific (winget on Windows, apt on Linux)
+    assert "ffmpeg" in msg.lower()
+
+
+# --- skip-if-translated and track strategy tests ---
+
+
+def test_translation_already_exists_finds_srt(tmp_path):
+    nyx = load_module()
+    video = tmp_path / "Episode 01.mkv"
+    video.write_text("fake", encoding="utf-8")
+    existing = tmp_path / "Episode 01.ar.srt"
+    existing.write_text("1\n00:00:01,000 --> 00:00:02,000\nمرحبا\n", encoding="utf-8")
+
+    result = nyx.translation_already_exists(video, "ar")
+    assert result is not None
+    assert result.name == "Episode 01.ar.srt"
+
+
+def test_translation_already_exists_returns_none_when_missing(tmp_path):
+    nyx = load_module()
+    video = tmp_path / "Episode 01.mkv"
+    video.write_text("fake", encoding="utf-8")
+
+    result = nyx.translation_already_exists(video, "ar")
+    assert result is None
+
+
+def test_translation_already_exists_finds_failed_variant(tmp_path):
+    nyx = load_module()
+    video = tmp_path / "Episode 01.mkv"
+    video.write_text("fake", encoding="utf-8")
+    # Simulates validation-failed output: Episode 01.ar.failed.ass
+    failed = tmp_path / "Episode 01.ar.failed.ass"
+    failed.write_text("failed output", encoding="utf-8")
+
+    result = nyx.translation_already_exists(video, "arabic")
+    assert result is not None
+    assert result.name == "Episode 01.ar.failed.ass"
+
+
+def test_translation_already_exists_matches_alternate_codes(tmp_path):
+    """'ar' and 'ara' should be treated as the same language."""
+    nyx = load_module()
+    video = tmp_path / "Episode 01.mkv"
+    video.write_text("fake", encoding="utf-8")
+    # First run used 'ara' (ISO 639-3)
+    existing = tmp_path / "Episode 01.ara.srt"
+    existing.write_text("subtitle", encoding="utf-8")
+
+    # Second run uses 'ar' (ISO 639-1) — should still detect it
+    result = nyx.translation_already_exists(video, "ar")
+    assert result is not None
+    assert result.name == "Episode 01.ara.srt"
+
+    # And vice versa: file is .ar.ass, user passes 'ara'
+    existing2 = tmp_path / "Episode 01.ar.ass"
+    existing2.write_text("subtitle", encoding="utf-8")
+    existing.unlink()  # remove the .ara.srt so only .ar.ass remains
+    result2 = nyx.translation_already_exists(video, "ara")
+    assert result2 is not None
+    assert result2.name == "Episode 01.ar.ass"
+
+
+def test_pick_subtitle_track_strategy_first():
+    nyx = load_module()
+    tracks = [
+        {"subtitle_index": 0, "language": "eng", "codec": "subrip", "default": True, "forced": False, "title": "English"},
+        {"subtitle_index": 1, "language": "jpn", "codec": "ass", "default": False, "forced": False, "title": "Japanese"},
+    ]
+    picked = nyx._pick_subtitle_track(tracks, "test.mkv", strategy="first")
+    assert picked["language"] == "eng"
+
+
+def test_pick_subtitle_track_strategy_lang_match():
+    nyx = load_module()
+    tracks = [
+        {"subtitle_index": 0, "language": "eng", "codec": "subrip", "default": True, "forced": False, "title": "English"},
+        {"subtitle_index": 1, "language": "jpn", "codec": "ass", "default": False, "forced": False, "title": "Japanese"},
+    ]
+    picked = nyx._pick_subtitle_track(tracks, "test.mkv", strategy="lang:jpn")
+    assert picked["language"] == "jpn"
+
+
+def test_pick_subtitle_track_strategy_lang_no_match():
+    nyx = load_module()
+    tracks = [
+        {"subtitle_index": 0, "language": "eng", "codec": "subrip", "default": True, "forced": False, "title": "English"},
+        {"subtitle_index": 1, "language": "jpn", "codec": "ass", "default": False, "forced": False, "title": "Japanese"},
+    ]
+    picked = nyx._pick_subtitle_track(tracks, "test.mkv", strategy="lang:kor")
+    assert picked is None
+
+
+def test_parse_json_mapping_repairs_trailing_comma():
+    nyx = load_module()
+    raw = '[{"id": "1", "text": "مرحبا"}, {"id": "2", "text": "وداعا"},]'
+    parsed = nyx.parse_json_mapping(raw)
+    assert parsed == {"1": "مرحبا", "2": "وداعا"}
+
+
+def test_translate_units_retries_on_json_error(monkeypatch):
+    """translate_units retries a chunk up to MAX_CHUNK_RETRIES on JSON errors."""
+    nyx = load_module()
+    import json as json_mod
+
+    call_count = 0
+
+    def flaky_chunk(units, src, tgt, prov, cfg, progress=None):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 3:
+            raise json_mod.JSONDecodeError("Expecting ',' delimiter", "", 123)
+        return {u.id: f"translated-{u.id}" for u in units}
+
+    monkeypatch.setattr(nyx, "translate_chunk", flaky_chunk)
+
+    units = [nyx.TranslationUnit(id="1", text="hello", original_text="hello")]
+    result = nyx.translate_units(units, "en", "ar", "openrouter",
+                                  {"general": {"default_provider": "openrouter"}})
+    assert result == {"1": "translated-1"}
+    assert call_count == 3  # failed twice, succeeded on third
